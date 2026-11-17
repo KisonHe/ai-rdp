@@ -1,0 +1,6 @@
+[mcp_servers.ai-rdp]
+command = "/Users/kisonhe/hex-meow/ai-rdp/.venv/bin/python"
+args = ["/Users/kisonhe/hex-meow/ai-rdp/scripts/mcp_entry.py"]
+startup_timeout_sec = 10
+tool_timeout_sec = 30
+enabled_tools = ["rdp_status", "rdp_observe", "rdp_act", "rdp_stop"]

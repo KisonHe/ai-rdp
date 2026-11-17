@@ -1,0 +1,9 @@
+.venv/
+build/
+.state/
+__pycache__/
+*.pyc
+.DS_Store
+*.egg-info/
+dist/
+third_party/FreeRDP/

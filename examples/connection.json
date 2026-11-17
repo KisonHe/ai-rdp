@@ -1,0 +1,7 @@
+{
+  "host": "192.0.2.10",
+  "port": 3389,
+  "username": "test-user",
+  "domain": "",
+  "certificate": "REPLACE_WITH_VERIFIED_SHA256"
+}
