@@ -4,6 +4,34 @@ if (location.hash) { sessionStorage.setItem("ai-rdp-watch", token); history.repl
 const $ = id => document.getElementById(id);
 let headers = {Authorization: `Bearer ${token}`};
 let objectURL = null, stopping = false;
+function showErrorText(message) {
+  $("error").textContent = message;
+  delete $("error").dataset.errorKey;
+}
+function renderError(status) {
+  const root = $("error");
+  const key = JSON.stringify([status.error, status.error_detail]);
+  if (root.dataset.errorKey === key) return;
+  root.replaceChildren();
+  root.dataset.errorKey = key;
+  const d = status.error_detail;
+  if (!d) { root.textContent = status.error || ""; return; }
+  const title = document.createElement("strong");
+  title.textContent = d.title; root.append(title);
+  for (const text of [d.message, d.target ? `目标：${d.target}` : "", d.hint ? `建议：${d.hint}` : ""]) {
+    if (!text) continue;
+    const p = document.createElement("p"); p.textContent = text; root.append(p);
+  }
+  const details = document.createElement("details");
+  const summary = document.createElement("summary"); summary.textContent = "技术详情";
+  const pre = document.createElement("pre");
+  pre.textContent = [d.symbol || d.reason,
+    d.code_hex ? `错误码：${d.code_hex}（${d.code}）` : "",
+    d.elapsed_seconds != null ? `连接等待：${d.elapsed_seconds} 秒` : "",
+    d.expected_certificate ? `配置指纹：${d.expected_certificate}` : "",
+    d.observed_certificate ? `远端指纹：${d.observed_certificate}` : ""].filter(Boolean).join("\n");
+  details.append(summary, pre); root.append(details);
+}
 addEventListener("hashchange", () => {
   if (!location.hash) return;
   token = location.hash.slice(1);
@@ -23,7 +51,7 @@ async function refresh() {
     $("stop").disabled = status.stopped;
     $("stop").textContent = status.stopped ? "已停止" : "立即停止 AI 操作";
     $("detail").textContent = status.stopped ? "显示停止前的最后画面" : status.desktop_size ? `画面更新于 ${Math.round(status.frame_age_ms / 1000)} 秒前` : "等待桌面画面";
-    $("error").textContent = status.error || "";
+    renderError(status);
     $("last").textContent = status.last_action ? `最近操作：${status.last_action.summary}` : "尚无操作";
     $("size").textContent = status.desktop_size ? status.desktop_size.join(" × ") : "";
     if (status.desktop_size && !stopping) {
@@ -36,7 +64,7 @@ async function refresh() {
       }
     }
   } catch (error) {
-    $("error").textContent = error.message;
+    showErrorText(error.message);
     $("state").textContent = "观察连接中断";
     $("detail").textContent = "画面可能已过期，请检查本机服务";
   }
@@ -48,6 +76,6 @@ $("stop").addEventListener("click", async () => {
     const response = await fetch("/v1/stop", {method:"POST", headers});
     if (!response.ok) throw new Error("未能确认停止，请在本机终端按 Ctrl+C 结束服务。");
     $("curtain").hidden = false; $("stop").disabled = true; $("stop").textContent = "已停止";
-  } catch (error) { $("error").textContent = error.message; stopping = false; }
+  } catch (error) { showErrorText(error.message); stopping = false; }
 });
 refresh();

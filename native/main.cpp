@@ -9,6 +9,7 @@
 #include <winpr/synch.h>
 #include <openssl/pem.h>
 #include <openssl/x509.h>
+#include <openssl/rand.h>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -22,9 +23,14 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <filesystem>
 #include <fcntl.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <io.h>
+#else
 #include <unistd.h>
+#endif
 
 static FILE* wire = nullptr;
 static std::mutex output_mutex, queue_mutex;
@@ -38,6 +44,38 @@ static UINT16 expected_port = 0;
 static std::set<UINT32> pressed;
 static UINT16 buttons = 0, mouse_x = 0, mouse_y = 0;
 static uint64_t generation = 0;
+
+class InputPacer {
+#ifdef _WIN32
+    HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002,
+                                          TIMER_MODIFY_STATE | SYNCHRONIZE);
+    std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::now();
+#endif
+public:
+    ~InputPacer() {
+#ifdef _WIN32
+        if (timer) CloseHandle(timer);
+#endif
+    }
+    void wait() {
+#ifdef _WIN32
+        // High-resolution per-process wait; no global timeBeginPeriod change.
+        // Ordinary Sleep(3) can take 15.6ms and exceed the command timeout.
+        if (timer) {
+            LARGE_INTEGER due; due.QuadPart = -30000; // Relative 3ms, in 100ns units.
+            if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE) &&
+                WaitForSingleObject(timer, 100) == WAIT_OBJECT_0) return;
+        }
+        // Older Windows: bound accumulated rounding, allowing at most a small burst.
+        auto now = std::chrono::steady_clock::now();
+        if (now > deadline + std::chrono::milliseconds(16)) deadline = now;
+        deadline += std::chrono::milliseconds(3);
+        std::this_thread::sleep_until(deadline);
+#else
+        std::this_thread::sleep_for(std::chrono::milliseconds(3));
+#endif
+    }
+};
 
 static void reply(const std::string& message) {
     std::lock_guard<std::mutex> guard(output_mutex);
@@ -64,8 +102,12 @@ static std::string unhex(const std::string& in) {
 static int verify_certificate(freerdp*, const BYTE* data, size_t length,
                               const char* host, UINT16 port, DWORD flags) {
     if (stopped) return 0;
-    if (!host || expected_host != host || port != expected_port ||
-        (flags & (VERIFY_CERT_FLAG_REDIRECT | VERIFY_CERT_FLAG_GATEWAY))) return 0;
+    if (!host || expected_host != host || port != expected_port) {
+        reply("CERT_ERROR 0 unexpected_target"); return 0;
+    }
+    if (flags & (VERIFY_CERT_FLAG_REDIRECT | VERIFY_CERT_FLAG_GATEWAY)) {
+        reply("CERT_ERROR 0 unsupported_redirect"); return 0;
+    }
     BIO* bio = BIO_new_mem_buf(data, static_cast<int>(length));
     X509* cert = bio ? PEM_read_bio_X509(bio, nullptr, nullptr, nullptr) : nullptr;
     unsigned char md[EVP_MAX_MD_SIZE];
@@ -81,6 +123,8 @@ static int verify_certificate(freerdp*, const BYTE* data, size_t length,
     // Explicit pinning, never accept-all / TOFU. No certificate is persisted by FreeRDP.
     if (fingerprint.size() == 64 && fingerprint == certificate_pin) return 2;
     if (!fingerprint.empty()) reply("CERT 0 " + fingerprint);
+    reply("CERT_ERROR 0 " + std::string(fingerprint.empty() ? "certificate_invalid" :
+                                       certificate_pin.empty() ? "certificate_untrusted" : "certificate_mismatch"));
     return 0;
 }
 static BOOL begin_paint(rdpContext* c) {
@@ -114,15 +158,38 @@ static void release_all() {
         if (buttons & b) (void)freerdp_input_send_mouse_event(input, b, mouse_x, mouse_y);
     buttons = 0;
 }
+static FILE* temporary_frame(std::filesystem::path& name) {
+#ifdef _WIN32
+    unsigned char random[12];
+    if (RAND_bytes(random, sizeof(random)) != 1) return nullptr;
+    std::string suffix;
+    for (auto b : random) { suffix += "0123456789abcdef"[b >> 4]; suffix += "0123456789abcdef"[b & 15]; }
+    name = std::filesystem::u8path(frame_path + "." + suffix);
+    HANDLE handle = CreateFileW(name.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                                FILE_ATTRIBUTE_TEMPORARY, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return nullptr;
+    int fd = _open_osfhandle(reinterpret_cast<intptr_t>(handle), _O_WRONLY | _O_BINARY);
+    if (fd < 0) { CloseHandle(handle); DeleteFileW(name.c_str()); return nullptr; }
+    FILE* f = _fdopen(fd, "wb");
+    if (!f) { _close(fd); DeleteFileW(name.c_str()); }
+    return f;
+#else
+    std::string tmp = frame_path + ".XXXXXX";
+    std::vector<char> buffer(tmp.begin(), tmp.end()); buffer.push_back(0);
+    int fd = mkstemp(buffer.data());
+    if (fd < 0) return nullptr;
+    name = std::filesystem::u8path(buffer.data());
+    FILE* f = fdopen(fd, "wb");
+    if (!f) { close(fd); unlink(buffer.data()); }
+    return f;
+#endif
+}
 static bool capture() {
     auto* g = instance->context->gdi;
     if (!g || !g->primary_buffer || g->width < 1 || g->height < 1) return false;
-    std::string tmp = frame_path + ".XXXXXX";
-    std::vector<char> name(tmp.begin(), tmp.end()); name.push_back(0);
-    int fd = mkstemp(name.data());
-    if (fd < 0) return false;
-    FILE* f = fdopen(fd, "wb");
-    if (!f) { close(fd); unlink(name.data()); return false; }
+    std::filesystem::path name;
+    FILE* f = temporary_frame(name);
+    if (!f) return false;
     bool ok = std::fprintf(f, "P6\n%d %d\n255\n", g->width, g->height) > 0;
     std::vector<unsigned char> row(static_cast<size_t>(g->width) * 3);
     for (int y = 0; y < g->height && ok; ++y) {
@@ -133,8 +200,23 @@ static bool capture() {
         ok = fwrite(row.data(), 1, row.size(), f) == row.size();
     }
     if (fclose(f)) ok = false;
-    if (ok) ok = rename(name.data(), frame_path.c_str()) == 0;
-    if (!ok) unlink(name.data());
+    if (ok) {
+#ifdef _WIN32
+        auto target = std::filesystem::u8path(frame_path);
+        ok = false;
+        for (int attempt = 0; attempt < 5; ++attempt) {
+            if (MoveFileExW(name.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+                ok = true; break;
+            }
+            auto error = GetLastError();
+            if (error != ERROR_SHARING_VIOLATION && error != ERROR_ACCESS_DENIED) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+#else
+        ok = rename(name.c_str(), frame_path.c_str()) == 0;
+#endif
+    }
+    if (!ok) { std::error_code ignored; std::filesystem::remove(name, ignored); }
     return ok;
 }
 static void execute(const std::string& line) {
@@ -174,6 +256,7 @@ static void execute(const std::string& line) {
             std::string text; s >> text;
             auto raw = unhex(text);
             if (raw.size() % 2 || raw.size() > 8192) throw std::runtime_error("invalid_text");
+            InputPacer pacer;
             for (size_t n = 0; n < raw.size(); n += 2) {
                 if (stopped) throw std::runtime_error("stopped");
                 const UINT16 u = static_cast<unsigned char>(raw[n]) |
@@ -182,7 +265,7 @@ static void execute(const std::string& line) {
                     !freerdp_input_send_unicode_keyboard_event(c->input, KBD_FLAGS_RELEASE, u))
                     throw std::runtime_error("input_failed");
                 // Bound bursts into Windows' input queue without making the caller type per key.
-                std::this_thread::sleep_for(std::chrono::milliseconds(3));
+                pacer.wait();
             }
         } else if (op == "RELEASE") release_all();
         else throw std::runtime_error("unknown_command");
@@ -192,9 +275,16 @@ static void execute(const std::string& line) {
     }
 }
 int main() {
+#ifdef _WIN32
+    WSADATA sockets;
+    if (WSAStartup(MAKEWORD(2, 2), &sockets) != 0) return 1;
+    wire = _fdopen(_dup(_fileno(stdout)), "w");
+    _dup2(_fileno(stderr), _fileno(stdout));
+#else
     umask(0077);
     wire = fdopen(dup(STDOUT_FILENO), "w");
     dup2(STDERR_FILENO, STDOUT_FILENO); // Keep all library output out of the response pipe.
+#endif
     if (!wire) return 1;
     std::string init;
     if (!std::getline(std::cin, init) || init.size() > 20000) return 1;
@@ -229,7 +319,7 @@ int main() {
               freerdp_settings_set_bool(settings, FreeRDP_NetworkAutoDetect, FALSE) &&
               freerdp_settings_set_bool(settings, FreeRDP_RedirectClipboard, FALSE) &&
               freerdp_settings_set_bool(settings, FreeRDP_AutoReconnectionEnabled, FALSE);
-    // No disk, USB, audio, clipboard or input redirection from the Mac.
+    // No disk, USB, audio, clipboard or input redirection from the controller host.
     std::fill(password.begin(), password.end(), 0);
     std::fill(init.begin(), init.end(), 0);
     instance->PostConnect = post_connect;
@@ -259,7 +349,9 @@ int main() {
     // Reader lifetime is bounded by process lifetime; it may be blocked on stdin on disconnect.
     reader.detach();
     if (stopped || !freerdp_connect(instance)) {
-        reply("ERR 0 connect_failed_" + std::to_string(freerdp_get_last_error(instance->context)));
+        const auto code = freerdp_get_last_error(instance->context);
+        const char* name = freerdp_get_last_error_name(code);
+        reply("ERR 0 connect_failed_" + std::to_string(code) + " " + (name ? name : "UNKNOWN"));
         std::_Exit(2);
     }
     reply("OK 0 connected");
@@ -274,6 +366,11 @@ int main() {
         std::deque<std::string> batch;
         { std::lock_guard<std::mutex> lock(queue_mutex); batch.swap(commands); ResetEvent(command_event); }
         for (const auto& line : batch) { if (stopped) break; execute(line); }
+    }
+    if (!stopped) {
+        const auto code = freerdp_get_last_error(instance->context);
+        const char* name = freerdp_get_last_error_name(code);
+        reply("ERR 0 disconnected_" + std::to_string(code) + " " + (name ? name : "UNKNOWN"));
     }
     stopped = true;
     release_all();

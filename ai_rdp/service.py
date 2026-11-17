@@ -4,6 +4,7 @@ import hmac
 import json
 import os
 import secrets
+import sys
 import threading
 import time
 import uuid
@@ -12,6 +13,8 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .frames import Frames, png
+from .errors import RdpError
+from .platform_support import write_private_json
 
 KEYS = {"esc": 1, "escape": 1, "backspace": 14, "tab": 15, "enter": 28,
         "ctrl": 29, "control": 29, "shift": 42, "alt": 56, "space": 57,
@@ -43,6 +46,7 @@ class Controller:
         self.state_lock = threading.RLock()
         self.state = "connecting"
         self.error = None
+        self.error_detail = None
         self.last_action = None
         self.pointer = None
         self.stop_reason = None
@@ -67,10 +71,18 @@ class Controller:
                 self.stop_event.wait(.25)
         except Exception as exc:
             config.clear()
+            report = False
             with self.state_lock:
                 if not self.stop_event.is_set():
                     self.state, self.error = "failed", str(exc)
+                    if isinstance(exc, RdpError):
+                        self.error_detail = exc.detail.copy()
+                        report = True
             self.backend.stop()
+            # A slow/closed terminal must not hold the lock used by operator stop.
+            if report:
+                try: print(str(exc), file=sys.stderr, flush=True)
+                except OSError: pass
 
     def status(self):
         with self.state_lock:
@@ -83,7 +95,8 @@ class Controller:
                     "demo": self.demo, "desktop_size": size,
                     "frame_age_ms": round(age * 1000) if age is not None else None,
                     "last_action": self.last_action, "pointer": self.pointer,
-                    "error": self.error, "stop_reason": self.stop_reason,
+                    "error": self.error, "error_detail": self.error_detail,
+                    "stop_reason": self.stop_reason,
                     "stopped": self.stop_event.is_set(),
                     "restart_required": self.stop_event.is_set()}
 
@@ -327,6 +340,5 @@ def write_runtime(state_dir, port, control_token, watch_token, session_id):
     data = {"pid": os.getpid(), "base_url": f"http://127.0.0.1:{port}",
             "control_token": control_token, "watch_token": watch_token, "session_id": session_id}
     path = state_dir / "runtime.json"
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as file: json.dump(data, file)
+    write_private_json(path, data)
     return data

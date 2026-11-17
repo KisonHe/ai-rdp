@@ -10,16 +10,15 @@ from urllib.parse import urlsplit
 from mcp import types
 from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
+from .platform_support import check_private
 
 
 class Client:
     def __init__(self, state_dir): self.runtime_path = Path(state_dir) / "runtime.json"
 
     def request(self, method, path, data=None):
-        stat = self.runtime_path.stat()
-        if stat.st_uid != os.getuid() or stat.st_mode & 0o077:
-            raise RuntimeError("runtime.json must be owned by this user and have mode 0600")
-        runtime = json.loads(self.runtime_path.read_text())
+        check_private(self.runtime_path)
+        runtime = json.loads(self.runtime_path.read_text(encoding="utf-8"))
         url = urlsplit(runtime["base_url"])
         if url.scheme != "http" or url.hostname != "127.0.0.1" or not url.port:
             raise RuntimeError("Only a local ai-rdp service is supported")

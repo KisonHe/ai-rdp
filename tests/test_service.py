@@ -3,7 +3,10 @@ import json
 import threading
 import time
 import unittest
+import contextlib
+import io
 from ai_rdp.backend import DemoBackend
+from ai_rdp.errors import native_error
 from ai_rdp.service import Controller, LocalServer
 
 
@@ -115,6 +118,17 @@ class HttpTests(unittest.TestCase):
         second = json.loads(self.request("POST", "/v1/observe", "control", {})[1])
         self.assertEqual(first["mode"], "full")
         self.assertEqual(second["patches"], [])
+
+    def test_connection_failure_is_available_to_observer_as_structured_diagnosis(self):
+        def fail(**_): raise native_error("connect_failed_131078")
+        self.backend.connect = fail
+        with contextlib.redirect_stderr(io.StringIO()): self.controller.start({})
+        code, data = self.request("GET", "/v1/status", "watch")
+        status = json.loads(data)
+        self.assertEqual(code, 200)
+        self.assertEqual(status["state"], "failed")
+        self.assertEqual(status["error_detail"]["code"], 131078)
+        self.assertIn("无法连接到远程桌面端口", status["error"])
 
 
 if __name__ == "__main__": unittest.main()

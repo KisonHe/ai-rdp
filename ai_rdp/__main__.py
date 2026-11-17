@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import fcntl
 import getpass
 import json
 import os
@@ -14,12 +13,16 @@ from pathlib import Path
 
 from .backend import DemoBackend, NativeBackend
 from .service import Controller, LocalServer, write_runtime
+from .platform_support import lock_state, native_binary, prepare_state
 
 ROOT = Path(__file__).resolve().parent.parent
 
 
 def main():
     os.umask(0o077)
+    if os.name == "nt":
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description="Local C++ FreeRDP bridge with an observer and latched stop")
     sub = parser.add_subparsers(dest="command", required=True)
     serve = sub.add_parser("serve")
@@ -48,23 +51,21 @@ def main():
         run(args.state_dir)
         return
     state = args.state_dir.resolve()
-    state.mkdir(parents=True, exist_ok=True, mode=0o700)
-    state.chmod(0o700)
-    lock = (state / "service.lock").open("a")
-    try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    prepare_state(state)
+    try: lock = lock_state(state / "service.lock")
     except BlockingIOError: parser.error("Another service is using this state directory")
-    binary = ROOT / "build" / "native" / "ai-rdp-native"
+    binary = native_binary(ROOT)
     if args.command == "probe":
         backend = NativeBackend(binary, state)
         try:
             backend.connect(host=args.host, port=args.port, username=args.username, password="",
                             domain="", width=1600, height=900, certificate="")
-        except RuntimeError:
+        except RuntimeError as exc:
             if backend.certificate:
                 print(json.dumps({"host": args.host, "port": args.port, "sha256": backend.certificate,
                                   "trusted": False, "password_sent": False}))
             else:
-                print("Could not retrieve an RDP certificate; see the private native log.", file=sys.stderr)
+                print(str(exc), file=sys.stderr)
                 raise SystemExit(1)
         finally: backend.stop()
         return
@@ -73,7 +74,7 @@ def main():
     if args.demo:
         backend, config = DemoBackend(args.width, args.height), {}
     else:
-        profile = json.loads(args.profile.read_text()) if args.profile else {}
+        profile = json.loads(args.profile.read_text(encoding="utf-8-sig")) if args.profile else {}
         host = args.host or profile.get("host")
         username = args.username or profile.get("username")
         certificate = args.cert_sha256 or profile.get("certificate", "")
@@ -81,7 +82,8 @@ def main():
         if not host or not username: parser.error("--host and --username (or a profile) are required")
         if not re.fullmatch(r"[a-f0-9]{64}", certificate):
             parser.error("Supply a verified SHA256 certificate pin; use 'probe' to inspect, not automatically trust")
-        if not binary.is_file(): parser.error("Native bridge not built; run scripts/build.sh")
+        if not binary.is_file():
+            parser.error("Native backend missing; use the release for this platform or follow the developer build instructions")
         password = sys.stdin.readline().rstrip("\r\n") if args.password_stdin else getpass.getpass("Windows password (not saved): ")
         if not password: parser.error("An existing Windows password is required")
         backend = NativeBackend(binary, state)
